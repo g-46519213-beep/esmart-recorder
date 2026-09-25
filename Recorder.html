@@ -64,24 +64,113 @@ window.addEventListener('message',function(ev){
 window.addEventListener('beforeunload',function(){if(!finished)send({type:'esmart-rec-closed'})});
 
 function startSpeechRecognition(){
-  if(!srSupported){srFinished=true;return}
-  try{
-    recog=new SR();
-    recog.lang='zh-CN';
-    recog.continuous=false;
-    recog.interimResults=false;
-    recog.maxAlternatives=1;
-    recog.onresult=function(e){
-      var t='';for(var i=0;i<e.results.length;i++)t+=e.results[i][0].transcript;
-      srTranscript=t;
+  if(!srSupported){
+    srFinished=true;
+    return;
+  }
+
+  /*
+   * SpeechRecognition is best-effort.  We keep it alive for the whole recording
+   * instead of allowing the first moment of silence to end recognition.
+   * When possible, Chrome is also given the same microphone track already
+   * opened by getUserMedia(), avoiding a second independent microphone capture.
+   */
+  var attempts=0,recognizing=false;
+
+  function makeRecognition(){
+    var r=new SR();
+    r.lang='zh-CN';
+    r.continuous=true;
+    r.interimResults=true;
+    r.maxAlternatives=5;
+
+    r.onstart=function(){
+      recognizing=true;
     };
-    recog.onerror=function(){/* best effort; recording continues */};
-    recog.onend=function(){srFinished=true;clearTimeout(srSafetyTimer);trySend()};
-    recog.start();
-    srSafetyTimer=setTimeout(function(){
-      if(!srFinished){srFinished=true;try{recog.abort()}catch(e){};trySend()}
-    },(maxSec+4)*1000);
-  }catch(e){srSupported=false;srFinished=true}
+
+    r.onresult=function(e){
+      var finals=[];
+      for(var i=0;i<e.results.length;i++){
+        if(e.results[i].isFinal){
+          var best=e.results[i][0];
+          if(best&&best.transcript)finals.push(best.transcript);
+        }
+      }
+      if(finals.length){
+        srTranscript=finals.join('');
+      }
+    };
+
+    r.onerror=function(e){
+      recognizing=false;
+      /* no-speech / aborted are recoverable while recording */
+      var recoverable=e&&(
+        e.error==='no-speech' ||
+        e.error==='aborted' ||
+        e.error==='audio-capture' ||
+        e.error==='network'
+      );
+      if(!recoverable){
+        srSupported=false;
+        srFinished=true;
+        return;
+      }
+    };
+
+    r.onend=function(){
+      recognizing=false;
+      if(finished||audioFinished||!mediaRec||mediaRec.state!=='recording'){
+        srFinished=true;
+        clearTimeout(srSafetyTimer);
+        trySend();
+        return;
+      }
+
+      /* Restart recognition if Chrome ended it because of a pause/no-speech. */
+      if(attempts<8){
+        attempts++;
+        setTimeout(startAgain,250);
+      }
+    };
+
+    return r;
+  }
+
+  function startAgain(){
+    if(finished||audioFinished||!mediaRec||mediaRec.state!=='recording')return;
+    try{
+      recog=makeRecognition();
+      var track=stream&&stream.getAudioTracks?stream.getAudioTracks()[0]:null;
+      if(track){
+        try{
+          recog.start(track);
+          return;
+        }catch(e){
+          /* Fall back to the normal microphone source. */
+        }
+      }
+      recog.start();
+    }catch(e){
+      /* A second start can race with the browser's internal stop. Retry shortly. */
+      attempts++;
+      if(attempts<8)setTimeout(startAgain,350);
+      else{
+        srSupported=false;
+        srFinished=true;
+        trySend();
+      }
+    }
+  }
+
+  srFinished=false;
+  startAgain();
+  srSafetyTimer=setTimeout(function(){
+    if(!srFinished){
+      srFinished=true;
+      try{if(recog)recog.stop()}catch(e){}
+      trySend();
+    }
+  },(maxSec+5)*1000);
 }
 
 if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia||!window.MediaRecorder){
@@ -110,7 +199,7 @@ if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia||!window.MediaR
       msg.textContent='Sedang rakam... ('+left+'s)';
       stopBtn.hidden=false;
       stopBtn.addEventListener('click',finish);
-      startSpeechRecognition();
+      setTimeout(startSpeechRecognition,150);
       timer=setInterval(function(){
         left--;
         if(left<=0){finish();return}
