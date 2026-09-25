@@ -1,0 +1,133 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rakam - eSMART</title>
+<style>
+  :root{--ink:#14154B;--sun:#FFC72C;--red:#D62839;--sky:#DCE6FF}
+  body{margin:0;font-family:Arial,Helvetica,sans-serif;background:var(--ink);color:#fff;
+       display:flex;flex-direction:column;align-items:center;justify-content:center;
+       height:100vh;text-align:center;padding:20px;box-sizing:border-box}
+  .dot{width:96px;height:96px;border-radius:50%;background:var(--red);display:flex;
+       align-items:center;justify-content:center;font-size:38px;margin-bottom:18px}
+  .dot.live{animation:pulse 1.1s ease-in-out infinite}
+  @keyframes pulse{50%{transform:scale(1.08)}}
+  button{margin-top:20px;font-size:17px;font-weight:800;padding:12px 26px;border-radius:999px;
+         border:none;background:var(--sun);color:var(--ink);cursor:pointer}
+  button:active{transform:translateY(1px)}
+  p{font-weight:700;max-width:280px;line-height:1.4}
+  .err{color:#FF9B9E;font-weight:800}
+  .small{font-weight:600;font-size:13px;color:#B9BCE6;margin-top:10px}
+</style>
+</head>
+<body>
+  <div class="dot" id="dot">🎙️</div>
+  <p id="msg">Sila benarkan akses mikrofon apabila diminta...</p>
+  <button id="stopBtn" hidden>Berhenti &amp; hantar</button>
+  <p class="small">Tetingkap ini akan tutup sendiri selepas selesai.</p>
+<script>
+(function(){
+'use strict';
+var maxSec=Number(new URLSearchParams(location.search).get('max')||'6');
+var mediaRec=null,chunks=[],left=maxSec,timer=null,stream=null;
+var dot=document.getElementById('dot'),msg=document.getElementById('msg'),stopBtn=document.getElementById('stopBtn');
+var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+var srSupported=!!SR,srFinished=!srSupported,srTranscript=null,recog=null,srSafetyTimer=null;
+var audioFinished=false,audioResult=null,finished=false;
+
+function send(payload){
+  try{if(window.opener&&!window.opener.closed)window.opener.postMessage(payload,'*')}catch(e){}
+}
+function trySend(){
+  if(finished||!audioFinished||!srFinished)return;
+  finished=true;
+  if(!audioResult){send({type:'esmart-rec-error',reason:'empty'});try{window.close()}catch(e){};return}
+  send({type:'esmart-rec-done',dataUrl:audioResult,transcript:srTranscript,transcriptSupported:srSupported});
+  setTimeout(function(){try{window.close()}catch(e){}},50);
+}
+function finish(){
+  clearInterval(timer);
+  stopBtn.hidden=true;
+  dot.classList.remove('live');
+  msg.textContent='Menghantar rakaman...';
+  if(recog&&!srFinished){try{recog.stop()}catch(e){srFinished=true;clearTimeout(srSafetyTimer)}}
+  if(mediaRec&&mediaRec.state==='recording'){
+    mediaRec.stop();
+  }else if(!audioFinished){
+    audioFinished=true;audioResult=null;trySend();
+  }
+}
+window.addEventListener('message',function(ev){
+  if(ev.data&&ev.data.type==='esmart-rec-stop')finish();
+});
+window.addEventListener('beforeunload',function(){if(!finished)send({type:'esmart-rec-closed'})});
+
+function startSpeechRecognition(){
+  if(!srSupported){srFinished=true;return}
+  try{
+    recog=new SR();
+    recog.lang='zh-CN';
+    recog.continuous=false;
+    recog.interimResults=false;
+    recog.maxAlternatives=1;
+    recog.onresult=function(e){
+      var t='';for(var i=0;i<e.results.length;i++)t+=e.results[i][0].transcript;
+      srTranscript=t;
+    };
+    recog.onerror=function(){/* best effort; recording continues */};
+    recog.onend=function(){srFinished=true;clearTimeout(srSafetyTimer);trySend()};
+    recog.start();
+    srSafetyTimer=setTimeout(function(){
+      if(!srFinished){srFinished=true;try{recog.abort()}catch(e){};trySend()}
+    },(maxSec+4)*1000);
+  }catch(e){srSupported=false;srFinished=true}
+}
+
+if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia||!window.MediaRecorder){
+  dot.textContent='⚠️';
+  msg.innerHTML='<span class="err">Perakam tidak disokong pada pelayar ini.</span>';
+  send({type:'esmart-rec-error',reason:'unsupported'});
+}else{
+  navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:true,autoGainControl:true}})
+    .then(function(s){
+      stream=s;
+      var types=['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/ogg'];
+      var mime=types.filter(function(t){return MediaRecorder.isTypeSupported(t)})[0]||'';
+      mediaRec=mime?new MediaRecorder(stream,{mimeType:mime}):new MediaRecorder(stream);
+      mediaRec.ondataavailable=function(e){if(e.data&&e.data.size)chunks.push(e.data)};
+      mediaRec.onstop=function(){
+        if(stream)stream.getTracks().forEach(function(t){t.stop()});
+        var blob=chunks.length?new Blob(chunks,{type:mediaRec.mimeType||mime||'audio/webm'}):null;
+        if(!blob){audioFinished=true;audioResult=null;trySend();return}
+        var fr=new FileReader();
+        fr.onload=function(){audioFinished=true;audioResult=fr.result;trySend()};
+        fr.onerror=function(){audioFinished=true;audioResult=null;trySend()};
+        fr.readAsDataURL(blob);
+      };
+      mediaRec.start();
+      dot.classList.add('live');
+      msg.textContent='Sedang rakam... ('+left+'s)';
+      stopBtn.hidden=false;
+      stopBtn.addEventListener('click',finish);
+      startSpeechRecognition();
+      timer=setInterval(function(){
+        left--;
+        if(left<=0){finish();return}
+        msg.textContent='Sedang rakam... ('+left+'s)';
+      },1000);
+    })
+    .catch(function(e){
+      var name=e&&e.name;
+      var reason=name==='NotFoundError'?'nomic':(name==='NotReadableError'?'busy':'blocked');
+      dot.textContent='⚠️';
+      msg.innerHTML='<span class="err">Akses mikrofon ditolak atau tidak tersedia.</span>';
+      if(recog){try{recog.abort()}catch(e2){}}
+      send({type:'esmart-rec-error',reason:reason});
+      try{window.close()}catch(e2){}
+    });
+}
+})();
+</script>
+</body>
+</html>
