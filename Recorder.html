@@ -33,35 +33,73 @@ var maxSec=Number(new URLSearchParams(location.search).get('max')||'6');
 var mediaRec=null,chunks=[],left=maxSec,timer=null,stream=null;
 var dot=document.getElementById('dot'),msg=document.getElementById('msg'),stopBtn=document.getElementById('stopBtn');
 var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-var srSupported=!!SR,srFinished=!srSupported,srTranscript=null,recog=null,srSafetyTimer=null;
-var audioFinished=false,audioResult=null,finished=false;
+var srSupported=!!SR;
+var srFinished=!srSupported;
+var srTranscript=null;
+var recog=null;
+var srSafetyTimer=null;
+var srStopTimer=null;
+var audioFinished=false,audioResult=null,finished=false,finishing=false;
+var bestConfidence=-1;
 
 function send(payload){
   try{if(window.opener&&!window.opener.closed)window.opener.postMessage(payload,'*')}catch(e){}
 }
+
 function trySend(){
   if(finished||!audioFinished||!srFinished)return;
   finished=true;
-  if(!audioResult){send({type:'esmart-rec-error',reason:'empty'});try{window.close()}catch(e){};return}
-  send({type:'esmart-rec-done',dataUrl:audioResult,transcript:srTranscript,transcriptSupported:srSupported});
-  setTimeout(function(){try{window.close()}catch(e){}},50);
+  if(!audioResult){
+    send({type:'esmart-rec-error',reason:'empty'});
+    try{window.close()}catch(e){}
+    return;
+  }
+  send({
+    type:'esmart-rec-done',
+    dataUrl:audioResult,
+    transcript:srTranscript||null,
+    transcriptSupported:srSupported,
+    transcriptConfidence:bestConfidence
+  });
+  setTimeout(function(){try{window.close()}catch(e){}},80);
 }
+
+function stopRecognitionSoon(delay){
+  clearTimeout(srStopTimer);
+  srStopTimer=setTimeout(function(){
+    if(!recog)return;
+    try{recog.stop()}catch(e){
+      try{recog.abort()}catch(e2){}
+    }
+  },delay||1200);
+}
+
 function finish(){
+  if(finishing)return;
+  finishing=true;
   clearInterval(timer);
   stopBtn.hidden=true;
   dot.classList.remove('live');
   msg.textContent='Menghantar rakaman...';
-  if(recog&&!srFinished){try{recog.stop()}catch(e){srFinished=true;clearTimeout(srSafetyTimer)}}
+
+  /* Give speech recognition a short grace period to return its final result. */
+  stopRecognitionSoon(1200);
+
   if(mediaRec&&mediaRec.state==='recording'){
     mediaRec.stop();
   }else if(!audioFinished){
-    audioFinished=true;audioResult=null;trySend();
+    audioFinished=true;
+    audioResult=null;
+    trySend();
   }
 }
+
 window.addEventListener('message',function(ev){
   if(ev.data&&ev.data.type==='esmart-rec-stop')finish();
 });
-window.addEventListener('beforeunload',function(){if(!finished)send({type:'esmart-rec-closed'})});
+window.addEventListener('beforeunload',function(){
+  if(!finished)send({type:'esmart-rec-closed'});
+});
 
 function startSpeechRecognition(){
   if(!srSupported){
@@ -69,94 +107,81 @@ function startSpeechRecognition(){
     return;
   }
 
-  /*
-   * SpeechRecognition is best-effort.  We keep it alive for the whole recording
-   * instead of allowing the first moment of silence to end recognition.
-   * When possible, Chrome is also given the same microphone track already
-   * opened by getUserMedia(), avoiding a second independent microphone capture.
-   */
-  var attempts=0,recognizing=false;
+  var attempts=0;
 
   function makeRecognition(){
     var r=new SR();
     r.lang='zh-CN';
     r.continuous=true;
     r.interimResults=true;
-    r.maxAlternatives=5;
+    r.maxAlternatives=3;
 
     r.onstart=function(){
-      recognizing=true;
+      attempts=0;
     };
 
     r.onresult=function(e){
-      var finals=[];
+      var latest='',latestConfidence=-1;
       for(var i=0;i<e.results.length;i++){
-        if(e.results[i].isFinal){
-          var best=e.results[i][0];
-          if(best&&best.transcript)finals.push(best.transcript);
-        }
+        var result=e.results[i];
+        if(!result||!result[0])continue;
+        var transcript=result[0].transcript||'';
+        var confidence=Number(result[0].confidence);
+        if(transcript)latest+=transcript;
+        if(!isNaN(confidence)&&confidence>=0)latestConfidence=Math.max(latestConfidence,confidence);
       }
-      if(finals.length){
-        srTranscript=finals.join('');
+      latest=String(latest||'').trim();
+      if(latest){
+        /* Keep interim text too: waiting only for a final result can miss short words. */
+        srTranscript=latest;
+        if(latestConfidence>=0)bestConfidence=Math.max(bestConfidence,latestConfidence);
       }
     };
 
+    r.onnomatch=function(){};
+
     r.onerror=function(e){
-      recognizing=false;
-      /* no-speech / aborted are recoverable while recording */
-      var recoverable=e&&(
-        e.error==='no-speech' ||
-        e.error==='aborted' ||
-        e.error==='audio-capture' ||
-        e.error==='network'
-      );
-      if(!recoverable){
+      var code=e&&e.error||'';
+      if(code==='not-allowed'||code==='service-not-allowed'){
         srSupported=false;
         srFinished=true;
         return;
       }
+      /* no-speech/network/audio-capture can end recognition; onend handles retry. */
     };
 
     r.onend=function(){
-      recognizing=false;
-      if(finished||audioFinished||!mediaRec||mediaRec.state!=='recording'){
+      if(finishing||audioFinished||!mediaRec||mediaRec.state!=='recording'){
         srFinished=true;
         clearTimeout(srSafetyTimer);
         trySend();
         return;
       }
-
-      /* Restart recognition if Chrome ended it because of a pause/no-speech. */
-      if(attempts<8){
+      if(attempts<6){
         attempts++;
-        setTimeout(startAgain,250);
+        setTimeout(startAgain,180);
+      }else{
+        srFinished=true;
+        clearTimeout(srSafetyTimer);
+        trySend();
       }
     };
-
     return r;
   }
 
   function startAgain(){
-    if(finished||audioFinished||!mediaRec||mediaRec.state!=='recording')return;
+    if(finishing||audioFinished||!mediaRec||mediaRec.state!=='recording')return;
     try{
       recog=makeRecognition();
-      var track=stream&&stream.getAudioTracks?stream.getAudioTracks()[0]:null;
-      if(track){
-        try{
-          recog.start(track);
-          return;
-        }catch(e){
-          /* Fall back to the normal microphone source. */
-        }
-      }
+      /* Use the normal microphone capture path. It is better supported than the
+         experimental SpeechRecognition.start(MediaStreamTrack) path. */
       recog.start();
     }catch(e){
-      /* A second start can race with the browser's internal stop. Retry shortly. */
       attempts++;
-      if(attempts<8)setTimeout(startAgain,350);
+      if(attempts<6)setTimeout(startAgain,300);
       else{
-        srSupported=false;
         srFinished=true;
+        clearTimeout(srSafetyTimer);
         trySend();
       }
     }
@@ -164,13 +189,14 @@ function startSpeechRecognition(){
 
   srFinished=false;
   startAgain();
+  clearTimeout(srSafetyTimer);
   srSafetyTimer=setTimeout(function(){
     if(!srFinished){
+      try{if(recog)recog.stop()}catch(e){try{if(recog)recog.abort()}catch(e2){}}
       srFinished=true;
-      try{if(recog)recog.stop()}catch(e){}
       trySend();
     }
-  },(maxSec+5)*1000);
+  },(maxSec+3)*1000);
 }
 
 if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia||!window.MediaRecorder){
